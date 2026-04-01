@@ -1,0 +1,18 @@
+http:
+  host: "0.0.0.0"
+  port: "8081"
+
+api:
+  basePath: "/api"
+
+salesforce:
+  consumerKey: "your-connected-app-consumer-key"
+  consumerSecret: "your-connected-app-consumer-secret"
+  username: "your-salesforce-username"
+  password: "your-salesforce-password"
+  securityToken: "your-security-token"
+
+erp:
+  host: "localhost"
+  port: "8082"
+  basePath: "/erp"

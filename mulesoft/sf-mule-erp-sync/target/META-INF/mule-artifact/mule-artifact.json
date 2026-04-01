@@ -1,0 +1,30 @@
+{
+  "configs": [
+    "customer-sync.xml"
+  ],
+  "secureProperties": [],
+  "supportedJavaVersions": [],
+  "redeploymentEnabled": true,
+  "name": "com.nisha.integration:sf-mule-erp-sync:1.0.0-SNAPSHOT",
+  "minMuleVersion": "4.10.0",
+  "requiredProduct": "MULE_EE",
+  "classLoaderModelLoaderDescriptor": {
+    "id": "mule",
+    "attributes": {
+      "exportedPackages": [],
+      "exportedResources": [
+        "log4j2.xml",
+        "customer-sync.xml",
+        "config-local.yaml.template",
+        "config.properties"
+      ]
+    }
+  },
+  "bundleDescriptorLoader": {
+    "id": "mule",
+    "attributes": {}
+  },
+  "javaSpecificationVersions": [
+    "17"
+  ]
+}
