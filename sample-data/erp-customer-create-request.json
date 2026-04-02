@@ -1,0 +1,8 @@
+{
+  "externalId": "CUST-1001",
+  "customerName": "Acme Corp",
+  "billingCity": "Orlando",
+  "billingCountry": "USA",
+  "salesforceId": "001TEST123",
+  "status": "PENDING"
+}

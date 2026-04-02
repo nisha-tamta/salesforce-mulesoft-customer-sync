@@ -1,0 +1,21 @@
+{
+  "salesforce": {
+    "items": [
+      {
+        "id": "001ak000021z0X5AAI",
+        "successful": true,
+        "errors": []
+      }
+    ],
+    "successful": true
+  },
+  "erp": {
+    "externalId": "CUST-1002",
+    "customerName": "Acme Corp 2",
+    "billingCity": "Orlando",
+    "billingCountry": "USA",
+    "salesforceId": "001ak000021z0X5AAI",
+    "status": "ACTIVE",
+    "lastUpdated": "2026-04-01T17:21:59.72423-04:00"
+  }
+}
