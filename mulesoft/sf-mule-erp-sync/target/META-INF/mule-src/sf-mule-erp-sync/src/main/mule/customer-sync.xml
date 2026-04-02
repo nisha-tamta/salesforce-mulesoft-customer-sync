@@ -1,46 +1,56 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
-      xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
-      xmlns:http="http://www.mulesoft.org/schema/mule/http"
-      xmlns="http://www.mulesoft.org/schema/mule/core"
-      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-      xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+	xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
       http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
       http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
       http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
 
-    <configuration-properties file="config.properties"/>
+	<configuration-properties
+		file="config.properties" />
 
-    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
-        <http:listener-connection host="${http.host}" port="${http.port}"/>
-    </http:listener-config>
+	<http:listener-config name="HTTP_Listener_config"
+		doc:name="HTTP Listener config">
+		<http:listener-connection host="${http.host}"
+			port="${http.port}" />
+	</http:listener-config>
 
-    <http:request-config name="ERP_Request_Config" doc:name="ERP Request config" basePath="${erp.basePath}">
-        <http:request-connection host="${erp.host}" port="${erp.port}"/>
-    </http:request-config>
+	<http:request-config name="ERP_Request_Config"
+		doc:name="ERP Request config" basePath="${erp.basePath}">
+		<http:request-connection host="${erp.host}"
+			port="${erp.port}" />
+	</http:request-config>
 
-    <salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config">
-		<salesforce:basic-connection username="${sf.username}" password="${sf.password}" token="ABLexCZ0tqmxFtUGixGIFBCIL" url="${sf.loginUrl}"/>
-    </salesforce:sfdc-config>
+	<salesforce:sfdc-config name="Salesforce_Config"
+		doc:name="Salesforce Config">
+		<salesforce:basic-connection
+			username="${sf.username}" password="${sf.password}"
+			token="${sf.token}" url="${sf.loginUrl}" />
+	</salesforce:sfdc-config>
 
-    <flow name="exp-customer-sync-api" doc:id="exp-customer-sync-api">
-        <http:listener doc:name="POST /customers/sync"
-                       config-ref="HTTP_Listener_config"
-                       path="${api.basePath}/customers/sync"
-                       allowedMethods="POST">
-            <http:response statusCode="#[(vars.httpStatus default 200) as Number]" />
-            <http:error-response statusCode="#[(vars.httpStatus default 500) as Number]" />
-        </http:listener>
+	<flow name="exp-customer-sync-api" doc:id="exp-customer-sync-api">
+		<http:listener doc:name="POST /customers/sync"
+			config-ref="HTTP_Listener_config"
+			path="${api.basePath}/customers/sync" allowedMethods="POST">
+			<http:response
+				statusCode="#[(vars.httpStatus default 200) as Number]" />
+			<http:error-response
+				statusCode="#[(vars.httpStatus default 500) as Number]" />
+		</http:listener>
 
-        <logger level="INFO" doc:name="Incoming request"
-                message='#["Incoming customer sync request payload=" ++ write(payload, "application/json")]'/>
+		<logger level="INFO" doc:name="Incoming request"
+			message='#["Incoming customer sync request payload=" ++ write(payload, "application/json")]' />
 
-        <set-variable variableName="correlationId" value="#[(attributes.headers.'x-correlation-id' default uuid()) as String]"/>
+		<set-variable variableName="correlationId"
+			value="#[(attributes.headers.'x-correlation-id' default uuid()) as String]" />
 
-        <ee:transform doc:name="Canonical request">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+		<ee:transform doc:name="Canonical request">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -49,25 +59,28 @@ output application/json
   billingCity: (payload.billingCity default "") as String,
   billingCountry: (payload.billingCountry default "") as String
 }]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
+			</ee:message>
+		</ee:transform>
 
-        <set-variable variableName="customer" value="#[payload]"/>
+		<set-variable variableName="customer" value="#[payload]" />
 
-        <choice doc:name="Validate request">
-            <when expression="#[(isEmpty(vars.customer.externalId) or isEmpty(vars.customer.name) or isEmpty(vars.customer.billingCity) or isEmpty(vars.customer.billingCountry))]">
-                <raise-error type="APP:VALIDATION" description="externalId, name, billingCity and billingCountry are required"/>
-            </when>
-        </choice>
+		<choice doc:name="Validate request">
+			<when
+				expression="#[(isEmpty(vars.customer.externalId) or isEmpty(vars.customer.name) or isEmpty(vars.customer.billingCity) or isEmpty(vars.customer.billingCountry))]">
+				<raise-error type="APP:VALIDATION"
+					description="externalId, name, billingCity and billingCountry are required" />
+			</when>
+		</choice>
 
-        <flow-ref name="proc-customer-sync"/>
+		<flow-ref name="proc-customer-sync" />
 
-        <error-handler>
-            <on-error-continue type="APP:VALIDATION" logException="true" doc:name="Validation error">
-                <set-variable variableName="httpStatus" value="400"/>
-                <ee:transform doc:name="Validation response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+		<error-handler>
+			<on-error-continue type="APP:VALIDATION"
+				logException="true" doc:name="Validation error">
+				<set-variable variableName="httpStatus" value="400" />
+				<ee:transform doc:name="Validation response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -76,14 +89,16 @@ output application/json
   errorType: "VALIDATION",
   message: error.description
 }]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-            </on-error-continue>
-            <on-error-continue type="ANY" logException="true" doc:name="Generic error">
-                <set-variable variableName="httpStatus" value="#[(vars.httpStatus default 500)]"/>
-                <ee:transform doc:name="Generic error response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+					</ee:message>
+				</ee:transform>
+			</on-error-continue>
+			<on-error-continue type="ANY" logException="true"
+				doc:name="Generic error">
+				<set-variable variableName="httpStatus"
+					value="#[(vars.httpStatus default 500)]" />
+				<ee:transform doc:name="Generic error response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -92,52 +107,72 @@ output application/json
   errorType: "SYSTEM",
   message: error.description default "Unexpected integration error"
 }]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-            </on-error-continue>
-        </error-handler>
-    </flow>
+					</ee:message>
+				</ee:transform>
+			</on-error-continue>
+		</error-handler>
+	</flow>
 
-    <flow name="proc-customer-sync" doc:id="proc-customer-sync">
-        <logger level="INFO" doc:name="Process start"
-        message='#[output text/plain ---
+	<flow name="proc-customer-sync" doc:id="proc-customer-sync">
+		<logger level="INFO" doc:name="Process start"
+			message='#[output text/plain ---
         "correlationId=" ++ ((vars.correlationId default "") as String) ++
-        " externalId=" ++ ((vars.customer.externalId default "") as String)]'/>
-        <flow-ref name="sys-salesforce-upsert-account"/>
-        <set-variable variableName="salesforceUpsertResult" value="#[payload]"/>
-        <set-variable variableName="salesforceRecordId" value="#[payload.items[0].id default payload.items[0].payload.id default null]"/>
-        <flow-ref name="sys-erp-upsert-customer"/>
-        <set-variable variableName="erpResponse" value="#[payload]"/>
-        <set-variable variableName="syncStatus" value="Synced"/>
-        <set-variable variableName="integrationMessage"
-              value='#[output text/plain ---
-              "ERP sync completed for externalId=" ++ ((vars.customer.externalId default "") as String)]'/>
-        <flow-ref name="sys-salesforce-update-status"/>
-        <ee:transform doc:name="Success response">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/json
+        " externalId=" ++ ((vars.customer.externalId default "") as String)]' />
+		<flow-ref name="sys-salesforce-upsert-account" />
+		<set-variable variableName="salesforceUpsertResult"
+			value="#[payload]" />
+		<set-variable variableName="salesforceRecordId"
+			value="#[payload.items[0].id default payload.items[0].payload.id default null]" />
+		<flow-ref name="sys-erp-upsert-customer" />
+		<set-variable variableName="erpResponse"
+			value="#[payload]" />
+		<set-variable variableName="syncStatus" value="Synced" />
+		<set-variable variableName="integrationMessage"
+			value='#[output text/plain ---
+              "ERP sync completed for externalId=" ++ ((vars.customer.externalId default "") as String)]' />
+		<flow-ref name="sys-salesforce-update-status" />
+		<set-variable variableName="salesforceUpsertItem" value="#[payload.items[0] default {}]"/>
+		<set-variable variableName="salesforceRecordId"
+    value="#[(vars.salesforceUpsertItem.id default vars.salesforceUpsertItem.payload.id default null)]"/>
+		<ee:transform doc:name="Success response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json skipNullOn="everywhere"
+var sfItem = vars.salesforceUpsertItem default {}
+var sfPayload = sfItem.payload default {}
+var erp = vars.erpResponse default {}
 ---
 {
   correlationId: vars.correlationId,
   status: "SUCCESS",
   salesforce: {
     id: vars.salesforceRecordId,
-    result: vars.salesforceUpsertResult
+    created: sfPayload.created default null,
+    success: sfPayload.success default sfItem.successful default true
   },
-  erp: vars.erpResponse
+  erp: {
+    externalId: erp.externalId default null,
+    customerName: erp.customerName default null,
+    billingCity: erp.billingCity default null,
+    billingCountry: erp.billingCountry default null,
+    salesforceId: erp.salesforceId default vars.salesforceRecordId,
+    status: erp.status default null,
+    lastUpdated: erp.lastUpdated default null
+  }
 }]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-        <error-handler>
-            <on-error-continue type="HTTP:*" logException="true" doc:name="ERP error handler">
-                <set-variable variableName="httpStatus" value="502"/>
-                <set-variable variableName="syncStatus" value="Failed"/>
-                <set-variable variableName="integrationMessage" value="#[error.description default 'ERP request failed']"/>
-                <flow-ref name="sys-salesforce-update-status"/>
-                <ee:transform doc:name="ERP failure response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+			</ee:message>
+		</ee:transform>
+		<error-handler>
+			<on-error-continue type="HTTP:*"
+				logException="true" doc:name="ERP error handler">
+				<set-variable variableName="httpStatus" value="502" />
+				<set-variable variableName="syncStatus" value="Failed" />
+				<set-variable variableName="integrationMessage"
+					value="#[error.description default 'ERP request failed']" />
+				<flow-ref name="sys-salesforce-update-status" />
+				<ee:transform doc:name="ERP failure response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -147,16 +182,17 @@ output application/json
   salesforceId: vars.salesforceRecordId,
   message: vars.integrationMessage
 }]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-            </on-error-continue>
-        </error-handler>
-    </flow>
+					</ee:message>
+				</ee:transform>
+			</on-error-continue>
+		</error-handler>
+	</flow>
 
-    <sub-flow name="sys-salesforce-upsert-account" doc:id="sys-salesforce-upsert-account">
-        <ee:transform doc:name="To Salesforce Account">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+	<sub-flow name="sys-salesforce-upsert-account"
+		doc:id="sys-salesforce-upsert-account">
+		<ee:transform doc:name="To Salesforce Account">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
 [
@@ -169,18 +205,18 @@ output application/java
     Integration_Message__c: "Requested by Mule"
   }
 ] ]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-        <salesforce:upsert objectType="Account"
-                           config-ref="Salesforce_Config"
-                           externalIdFieldName="External_Id__c"
-                           doc:name="Upsert Account"/>
-    </sub-flow>
+			</ee:message>
+		</ee:transform>
+		<salesforce:upsert objectType="Account"
+			config-ref="Salesforce_Config" externalIdFieldName="External_Id__c"
+			doc:name="Upsert Account" />
+	</sub-flow>
 
-    <sub-flow name="sys-erp-upsert-customer" doc:id="sys-erp-upsert-customer">
-        <ee:transform doc:name="To ERP Request">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
+	<sub-flow name="sys-erp-upsert-customer"
+		doc:id="sys-erp-upsert-customer">
+		<ee:transform doc:name="To ERP Request">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
 {
@@ -191,17 +227,21 @@ output application/json
   salesforceId: vars.salesforceRecordId,
   status: "ACTIVE"
 }]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-        <http:request method="POST" doc:name="POST /erp/customers" config-ref="ERP_Request_Config" path="/customers"/>
-    </sub-flow>
+			</ee:message>
+		</ee:transform>
+		<http:request method="POST"
+			doc:name="POST /erp/customers" config-ref="ERP_Request_Config"
+			path="/customers" />
+	</sub-flow>
 
-    <sub-flow name="sys-salesforce-update-status" doc:id="sys-salesforce-update-status">
-        <choice doc:name="Update status only if Salesforce ID exists">
-            <when expression="#[!isEmpty((vars.salesforceRecordId default '') as String)]">
-                <ee:transform doc:name="Build status update payload">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
+	<sub-flow name="sys-salesforce-update-status"
+		doc:id="sys-salesforce-update-status">
+		<choice doc:name="Update status only if Salesforce ID exists">
+			<when
+				expression="#[!isEmpty((vars.salesforceRecordId default '') as String)]">
+				<ee:transform doc:name="Build status update payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
 output application/java
 ---
 [
@@ -212,11 +252,12 @@ output application/java
     Integration_Message__c: vars.integrationMessage
   }
 ] ]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-                <salesforce:update type="Account" config-ref="Salesforce_Config" doc:name="Update Account status"/>
-            </when>
-        </choice>
-    </sub-flow>
+					</ee:message>
+				</ee:transform>
+				<salesforce:update type="Account"
+					config-ref="Salesforce_Config" doc:name="Update Account status" />
+			</when>
+		</choice>
+	</sub-flow>
 
 </mule>
