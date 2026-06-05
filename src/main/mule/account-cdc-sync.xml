@@ -107,7 +107,7 @@ payload.data.payload]]></ee:set-variable>
 			target="alreadyProcessed" doc:name="Check idempotency store" />
 
 		<choice doc:name="Already processed?">
-			<when expression="#[vars.alreadyProcessed == true]">
+			<when expression="#[vars.alreadyProcessed == true and vars.replayId != 0]">
 				<logger level="INFO" doc:name="Log skipped duplicate"
 					message='#[output text/plain --- "Skipping duplicate event — already processed. idempotencyKey=" ++ vars.idempotencyKey ++ " correlationId=" ++ vars.correlationId]' />
 			</when>
