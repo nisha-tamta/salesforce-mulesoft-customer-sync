@@ -1,4 +1,4 @@
-# Salesforce CDC → MuleSoft 4 → ERPNext  ·  Customer Sync
+# Salesforce to MuleSoft ERP Account CDC Sync
 
 Real-time, event-driven integration that listens to Salesforce Account Change Data Capture (CDC) events and keeps ERPNext Customer records in sync — automatically, with no polling and no manual trigger required.
 

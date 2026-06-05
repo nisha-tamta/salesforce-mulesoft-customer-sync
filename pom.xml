@@ -6,7 +6,7 @@
 	<artifactId>salesforce-mulesoft-customer-sync</artifactId>
 	<version>1.0.0-SNAPSHOT</version>
 	<packaging>mule-application</packaging>
-	<name>salesforce-mulesoft-customer-sync</name>
+	<name>Salesforce to MuleSoft ERP Account CDC Sync</name>
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
