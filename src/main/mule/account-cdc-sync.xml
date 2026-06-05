@@ -1,0 +1,640 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<configuration-properties
+		file="config.properties" />
+
+	<!-- Salesforce Connector Config -->
+	<salesforce:sfdc-config name="Salesforce_Config"
+		doc:name="Salesforce Config">
+		<salesforce:basic-connection
+			username="${sf.username}" password="${sf.password}"
+			token="${sf.token}" url="${sf.loginUrl}" />
+	</salesforce:sfdc-config>
+
+	<!-- ERPNext HTTP Config. basePath fixed to /api/resource — Frappe's REST
+		path for all DocTypes. -->
+	<http:request-config name="ERP_Request_Config"
+		doc:name="ERP Request Config" basePath="/api/resource">
+		<http:request-connection host="${erp.host}"
+			port="${erp.port}" />
+	</http:request-config>
+
+	<!-- Idempotency store: prevents re-processing the same CDC event if Salesforce
+		 replays it. Key = replayId_recordId_changeType. TTL = 7 days (covers the
+		 Salesforce event replay window). -->
+	<os:object-store name="idempotency-store"
+		doc:name="Idempotency Store"
+		persistent="true"
+		maxEntries="50000"
+		entryTtl="7"
+		entryTtlUnit="DAYS" />
+
+	<!-- DLQ store: holds events that failed after all processing attempts.
+		 No TTL — entries persist until manually reviewed and cleared via admin API. -->
+	<os:object-store name="dlq-store"
+		doc:name="DLQ Store"
+		persistent="true"
+		maxEntries="10000" />
+
+	<!-- ═══════════════════════════════════════════════════ EXPERIENCE LAYER
+		Subscribes to Salesforce AccountChangeEvent CDC channel. Fires automatically
+		on Account create, update, or delete. Extracts ChangeEventHeader, sets correlationId,
+		routes by changeType. ═══════════════════════════════════════════════════ -->
+	<flow name="cdc-account-event-api" doc:id="cdc-account-event-api">
+		<salesforce:replay-channel-listener
+			doc:name="AccountChangeEvent CDC listener"
+			config-ref="Salesforce_Config" streamingChannel="/data/AccountChangeEvent"
+			replayOption="FROM_LAST_REPLAY_ID" />
+
+		<set-variable variableName="correlationId"
+			value="#[uuid() as String]" doc:name="Set correlationId" />
+
+		<!-- Extract ChangeEventHeader fields + replayId into variables.
+			 replayId is saved early so it is available in the error handler. -->
+		<ee:transform doc:name="Extract event header">
+			<ee:variables>
+				<ee:set-variable variableName="replayId"><![CDATA[%dw 2.0
+output application/java
+---
+payload.event.replayId default 0]]></ee:set-variable>
+
+				<ee:set-variable variableName="changeType"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.payload.ChangeEventHeader.changeType default "UNKNOWN"]]></ee:set-variable>
+
+				<ee:set-variable variableName="recordId"><![CDATA[%dw 2.0
+output application/java
+---
+(payload.data.payload.ChangeEventHeader.recordIds default [])[0] default ""]]></ee:set-variable>
+
+				<ee:set-variable variableName="changedFields"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.payload.ChangeEventHeader.changedFields default []]]></ee:set-variable>
+
+				<ee:set-variable variableName="accountData"><![CDATA[%dw 2.0
+output application/java
+---
+payload.data.payload]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+
+		<logger level="INFO" doc:name="Log CDC event received"
+			message='#[output text/plain --- "CDC event received. replayId=" ++ (vars.replayId as String) ++ " changeType=" ++ vars.changeType ++ " recordId=" ++ vars.recordId ++ " changedFields=" ++ write(vars.changedFields, "application/json") ++ " correlationId=" ++ vars.correlationId]' />
+
+		<!-- Composite idempotency key: replayId catches true Salesforce re-deliveries;
+			 recordId+changeType protect against replayId=0 collisions in dev/sandbox. -->
+		<set-variable variableName="idempotencyKey"
+			value="#[(vars.replayId as String) ++ '_' ++ vars.recordId ++ '_' ++ vars.changeType]"
+			doc:name="Build idempotency key" />
+
+		<!-- Guard against duplicate delivery — Salesforce may re-send buffered events -->
+		<os:contains key="#[vars.idempotencyKey]" objectStore="idempotency-store"
+			target="alreadyProcessed" doc:name="Check idempotency store" />
+
+		<choice doc:name="Already processed?">
+			<when expression="#[vars.alreadyProcessed == true]">
+				<logger level="INFO" doc:name="Log skipped duplicate"
+					message='#[output text/plain --- "Skipping duplicate event — already processed. idempotencyKey=" ++ vars.idempotencyKey ++ " correlationId=" ++ vars.correlationId]' />
+			</when>
+			<otherwise>
+				<!-- Route by changeType — only handle known types -->
+				<choice doc:name="Route by changeType">
+					<when expression="#[vars.changeType == 'CREATE' or vars.changeType == 'UPDATE' or vars.changeType == 'UNDELETE']">
+						<flow-ref name="proc-account-cdc-sync" doc:name="proc-account-cdc-sync" />
+					</when>
+					<when expression="#[vars.changeType == 'DELETE' or vars.changeType == 'GAP_DELETE']">
+						<flow-ref name="proc-account-cdc-delete" doc:name="proc-account-cdc-delete" />
+					</when>
+					<otherwise>
+						<logger level="INFO" doc:name="Log skipped unknown changeType"
+							message='#[output text/plain --- "Skipping unsupported changeType=" ++ vars.changeType ++ " correlationId=" ++ vars.correlationId]' />
+					</otherwise>
+				</choice>
+
+				<!-- Mark event as successfully processed — prevents re-processing on replay.
+					 Only reaches here if the routing above completed without error. -->
+				<os:store key="#[vars.idempotencyKey]" objectStore="idempotency-store"
+					doc:name="Mark event as processed">
+					<os:value><![CDATA[#[output application/java --- {
+						processedAt:   now() as String { format: "yyyy-MM-dd'T'HH:mm:ss'Z'" },
+						correlationId: vars.correlationId,
+						changeType:    vars.changeType,
+						recordId:      vars.recordId
+					}]]]></os:value>
+				</os:store>
+			</otherwise>
+		</choice>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true"
+				doc:name="CDC error handler — writes to DLQ">
+				<logger level="ERROR" doc:name="Log CDC error"
+					message='#[output text/plain --- "CDC processing failed — writing to DLQ. changeType=" ++ (vars.changeType default "UNKNOWN") ++ " recordId=" ++ (vars.recordId default "UNKNOWN") ++ " error=" ++ error.description ++ " correlationId=" ++ (vars.correlationId default "UNKNOWN")]' />
+
+				<!-- Event is NOT marked processed so it remains eligible for replay.
+					 Store the full context so the DLQ admin API can replay it later. -->
+				<os:store key="#[vars.correlationId default uuid()]"
+					objectStore="dlq-store"
+					doc:name="Write failed event to DLQ">
+					<os:value><![CDATA[#[output application/java --- {
+						correlationId: vars.correlationId  default "UNKNOWN",
+						replayId:      vars.replayId       default 0,
+						recordId:      vars.recordId       default "UNKNOWN",
+						changeType:    vars.changeType     default "UNKNOWN",
+						errorMessage:  error.description,
+						errorType:     error.errorType.identifier,
+						failedAt:      now() as String { format: "yyyy-MM-dd'T'HH:mm:ss'Z'" },
+						changedFields: write(vars.changedFields default [], "application/json"),
+						accountData:   write(vars.accountData   default {},  "application/json")
+					}]]]></os:value>
+				</os:store>
+
+				<logger level="WARN" doc:name="Log DLQ write confirmed"
+					message='#[output text/plain --- "Event written to DLQ. Use POST /api/admin/dlq/" ++ (vars.correlationId default "UNKNOWN") ++ "/replay to retry."]' />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════ PROCESS LAYER —
+		CREATE / UPDATE / UNDELETE Routes to the correct system sub-flow. ═══════════════════════════════════════════════════ -->
+	<flow name="proc-account-cdc-sync" doc:id="proc-account-cdc-sync">
+		<logger level="INFO" doc:name="Log process start"
+			message='#["Processing " ++ vars.changeType ++ " for recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+		<choice doc:name="CREATE vs UPDATE">
+			<when expression="#[vars.changeType == 'CREATE']">
+				<flow-ref name="sys-erp-create-account"
+					doc:name="Create in ERP" />
+			</when>
+			<otherwise>
+				<flow-ref name="sys-erp-update-account"
+					doc:name="Update in ERP" />
+			</otherwise>
+		</choice>
+
+		<logger level="INFO" doc:name="Log process complete"
+			message='#["ERP sync complete. changeType=" ++ vars.changeType ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════ PROCESS LAYER —
+		DELETE ═══════════════════════════════════════════════════ -->
+	<flow name="proc-account-cdc-delete"
+		doc:id="proc-account-cdc-delete">
+		<logger level="INFO" doc:name="Log delete start"
+			message='#["Processing DELETE for recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+		<flow-ref name="sys-erp-deactivate-account"
+			doc:name="Deactivate in ERP" />
+		<logger level="INFO" doc:name="Log delete complete"
+			message='#["DELETE processing complete. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════ SYSTEM LAYER —
+		CREATE Maps CDC payload to ERPNext Customer DocType POST body. ═══════════════════════════════════════════════════ -->
+	<!-- ═══════════════════════════════════════════════════ SYSTEM LAYER —
+		CREATE Checks ERP first by custom_salesforce_id so the flow is idempotent.
+		If the record already exists (e.g. UPDATE's fallback ran first) → PUT.
+		If it does not exist → POST. Prevents duplicates regardless of thread order. ═══════════════════════════════════════════════════ -->
+	<sub-flow name="sys-erp-create-account"
+		doc:id="sys-erp-create-account">
+
+		<!-- Check whether this Salesforce Account already exists in ERP -->
+		<http:request method="GET"
+			config-ref="ERP_Request_Config" path="/Customer"
+			doc:name="GET Customer by Salesforce ID">
+			<http:headers><![CDATA[#[{
+				"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+			}]]]></http:headers>
+			<http:query-params><![CDATA[#[{
+				"filters": "[[\"Customer\",\"custom_salesforce_id\",\"=\",\"" ++ vars.recordId ++ "\"]]",
+				"fields": "[\"name\",\"customer_name\",\"custom_salesforce_id\"]"
+			}]]]></http:query-params>
+		</http:request>
+
+		<set-variable variableName="erpExistingName"
+			value="#[(payload.data default [])[0].name default null]"
+			doc:name="Store existing ERP name if found" />
+
+		<choice doc:name="ERP record already exists?">
+			<when expression="#[vars.erpExistingName != null]">
+				<!-- Record exists (UPDATE's fallback may have created it first) → update -->
+				<logger level="INFO" doc:name="Log CREATE resolved to PUT"
+					message='#[output text/plain --- "CREATE: ERP record already exists, updating instead. erpName=" ++ vars.erpExistingName ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+				<ee:transform doc:name="Build ERPNext PUT payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.accountData
+---
+{
+  customer_name: account.Name    default "",
+  mobile_no:     account.Phone   default "",
+  website:       account.Website default ""
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+
+				<http:request method="PUT"
+					config-ref="ERP_Request_Config"
+					path="#['/Customer/' ++ (vars.erpExistingName replace ' ' with '%20')]"
+					doc:name="PUT Customer to ERPNext">
+					<http:headers><![CDATA[#[{
+						"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+						"Content-Type": "application/json"
+					}]]]></http:headers>
+				</http:request>
+
+				<logger level="INFO" doc:name="Log CREATE PUT success"
+					message='#[output text/plain --- "ERPNext customer updated (CREATE→PUT). recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+			</when>
+			<otherwise>
+				<!-- No existing record → safe to create.
+					 If the unique constraint on custom_salesforce_id fires (409/duplicate),
+					 another thread beat us — recover by fetching that record and updating it. -->
+				<ee:transform doc:name="Build ERPNext POST payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.accountData
+---
+{
+  customer_name:        account.Name    default "",
+  customer_type:        "Company",
+  customer_group:       "Commercial",
+  territory:            "United States",
+  mobile_no:            account.Phone   default "",
+  website:              account.Website default "",
+  custom_salesforce_id: vars.recordId
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+
+				<try doc:name="POST with duplicate guard">
+					<http:request method="POST"
+						config-ref="ERP_Request_Config" path="/Customer"
+						doc:name="POST Customer to ERPNext">
+						<http:headers><![CDATA[#[{
+							"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+							"Content-Type": "application/json"
+						}]]]></http:headers>
+					</http:request>
+
+					<logger level="INFO" doc:name="Log ERPNext create success"
+						message='#[output text/plain --- "ERPNext customer created. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+					<!-- If a DELETE event arrived before this CREATE completed, the deactivate
+						 flow will have stored a pending disable marker. Check now and disable
+						 the record we just created so it doesn't stay active in ERP. -->
+					<set-variable variableName="newErpName"
+						value="#[payload.data.name default null]"
+						doc:name="Store new ERP record name from POST response" />
+
+					<os:contains key="#['pending_disable_' ++ vars.recordId]"
+						objectStore="idempotency-store"
+						target="hasPendingDisable"
+						doc:name="Check pending disable marker" />
+
+					<choice doc:name="Pending disable for this record?">
+						<when expression="#[vars.hasPendingDisable == true and vars.newErpName != null]">
+							<logger level="WARN" doc:name="Log pending disable found"
+								message='#[output text/plain --- "DELETE was pending before CREATE completed. Disabling newly created ERP record immediately. erpName=" ++ vars.newErpName ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+							<ee:transform doc:name="Build disable payload">
+								<ee:message>
+									<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ disabled: 1 }]]></ee:set-payload>
+								</ee:message>
+							</ee:transform>
+
+							<http:request method="PUT"
+								config-ref="ERP_Request_Config"
+								path="#['/Customer/' ++ (vars.newErpName replace ' ' with '%20')]"
+								doc:name="PUT disable newly created ERP customer">
+								<http:headers><![CDATA[#[{
+									"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+									"Content-Type": "application/json"
+								}]]]></http:headers>
+							</http:request>
+
+							<os:remove key="#['pending_disable_' ++ vars.recordId]"
+								objectStore="idempotency-store"
+								doc:name="Clear pending disable marker" />
+
+							<logger level="INFO" doc:name="Log pending disable resolved"
+								message='#[output text/plain --- "Pending disable resolved — ERP record disabled immediately after CREATE. erpName=" ++ vars.newErpName ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+						</when>
+					</choice>
+
+					<error-handler>
+						<!-- ERPNext unique constraint on custom_salesforce_id rejected the POST
+							 because another thread already inserted the record. Fetch it and PUT. -->
+						<on-error-continue type="HTTP:CLIENT_SECURITY, HTTP:UNAUTHORIZED, MULE:ANY"
+							when="#[error.cause.message contains 'DuplicateEntry' or error.cause.message contains 'duplicate' or (error.errorType.identifier == 'BAD_REQUEST')]"
+							doc:name="Handle duplicate entry from ERP unique constraint">
+
+							<logger level="WARN" doc:name="Log duplicate entry caught"
+								message='#[output text/plain --- "Duplicate entry rejected by ERP unique constraint. Fetching existing record to update. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+							<!-- Re-fetch the record that the other thread already created -->
+							<http:request method="GET"
+								config-ref="ERP_Request_Config" path="/Customer"
+								doc:name="GET existing Customer after duplicate error">
+								<http:headers><![CDATA[#[{
+									"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+								}]]]></http:headers>
+								<http:query-params><![CDATA[#[{
+									"filters": "[[\"Customer\",\"custom_salesforce_id\",\"=\",\"" ++ vars.recordId ++ "\"]]",
+									"fields": "[\"name\",\"customer_name\",\"custom_salesforce_id\"]"
+								}]]]></http:query-params>
+							</http:request>
+
+							<set-variable variableName="erpExistingName"
+								value="#[(payload.data default [])[0].name default null]"
+								doc:name="Store existing ERP name after duplicate" />
+
+							<ee:transform doc:name="Build recovery PUT payload">
+								<ee:message>
+									<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.accountData
+---
+{
+  customer_name: account.Name    default "",
+  mobile_no:     account.Phone   default "",
+  website:       account.Website default ""
+}]]></ee:set-payload>
+								</ee:message>
+							</ee:transform>
+
+							<http:request method="PUT"
+								config-ref="ERP_Request_Config"
+								path="#['/Customer/' ++ (vars.erpExistingName replace ' ' with '%20')]"
+								doc:name="PUT Customer to ERPNext (duplicate recovery)">
+								<http:headers><![CDATA[#[{
+									"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+									"Content-Type": "application/json"
+								}]]]></http:headers>
+							</http:request>
+
+							<logger level="INFO" doc:name="Log duplicate recovery success"
+								message='#[output text/plain --- "Duplicate recovery: updated existing record. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+						</on-error-continue>
+					</error-handler>
+				</try>
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<!-- ═══════════════════════════════════════════════════ SYSTEM LAYER —
+		UPDATE Sends only the fields that actually changed. Uses changedFields from
+		ChangeEventHeader to avoid overwriting unchanged ERPNext data with nulls.
+		Looks up ERPNext document name via custom_salesforce_id — CDC payload only
+		carries changed fields so vars.accountData.Name is unreliable as a path key. ═══════════════════════════════════════════════════ -->
+	<sub-flow name="sys-erp-update-account"
+		doc:id="sys-erp-update-account">
+
+		<http:request method="GET"
+			config-ref="ERP_Request_Config" path="/Customer"
+			doc:name="GET Customer by Salesforce ID">
+			<http:headers><![CDATA[#[{
+				"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+			}]]]></http:headers>
+			<http:query-params><![CDATA[#[{
+				"filters": "[[\"Customer\",\"custom_salesforce_id\",\"=\",\"" ++ vars.recordId ++ "\"]]",
+				"fields": "[\"name\",\"customer_name\",\"custom_salesforce_id\"]"
+			}]]]></http:query-params>
+		</http:request>
+
+		<set-variable variableName="erpCustomerName"
+			value="#[(payload.data default [])[0].name default null]"
+			doc:name="Store ERPNext customer document name" />
+
+		<choice doc:name="ERP customer found?">
+			<when expression="#[vars.erpCustomerName != null]">
+				<ee:transform
+					doc:name="Build ERPNext update payload — changed fields only">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.accountData
+var changed  = vars.changedFields
+---
+{
+  (customer_name: account.Name) if (changed contains "Name"),
+  (mobile_no: account.Phone)    if (changed contains "Phone"),
+  (website: account.Website)    if (changed contains "Website")
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+
+				<http:request method="PUT"
+					config-ref="ERP_Request_Config"
+					path="#['/Customer/' ++ (vars.erpCustomerName replace ' ' with '%20')]"
+					doc:name="PUT Customer to ERPNext">
+					<http:headers><![CDATA[#[{
+						"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+						"Content-Type": "application/json"
+					}]]]></http:headers>
+				</http:request>
+
+				<logger level="INFO" doc:name="Log ERPNext update response"
+					message='#[output text/plain --- "ERPNext customer updated. erpName=" ++ vars.erpCustomerName ++ " recordId=" ++ vars.recordId ++ " changedFields=" ++ write(vars.changedFields, "application/json") ++ " correlationId=" ++ vars.correlationId]' />
+			</when>
+			<otherwise>
+				<!-- Customer not found on first ERP lookup — race condition: CREATE and
+					 UPDATE events arrived together and UPDATE ran first.
+					 Step 1: fetch full Account from Salesforce (CDC only carries changed fields).
+					 Step 2: re-check ERP — CREATE may have finished during step 1.
+					 Step 3a: record now exists → PUT (update it with full SF data).
+					 Step 3b: still missing → POST (safe to create, no duplicate risk). -->
+				<logger level="WARN" doc:name="Log fallback start"
+					message='#[output text/plain --- "ERP customer not found during UPDATE. Fetching full Account from Salesforce then re-checking ERP. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+				<!-- Step 1: fetch full Account from Salesforce -->
+				<salesforce:query doc:name="Query full Account from Salesforce"
+					config-ref="Salesforce_Config">
+					<salesforce:salesforce-query>#[output application/java --- "SELECT Id, Name, Phone, Website FROM Account WHERE Id = '" ++ vars.recordId ++ "'"]</salesforce:salesforce-query>
+				</salesforce:query>
+
+				<set-variable variableName="sfFallbackAccount"
+					value="#[(payload default [])[0] default null]"
+					doc:name="Store fallback Account record" />
+
+				<choice doc:name="Salesforce account found?">
+					<when expression="#[vars.sfFallbackAccount != null]">
+
+						<!-- Step 2: re-check ERP — CREATE may have completed while we queried Salesforce -->
+						<http:request method="GET"
+							config-ref="ERP_Request_Config" path="/Customer"
+							doc:name="Re-check ERP Customer by Salesforce ID">
+							<http:headers><![CDATA[#[{
+								"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+							}]]]></http:headers>
+							<http:query-params><![CDATA[#[{
+								"filters": "[[\"Customer\",\"custom_salesforce_id\",\"=\",\"" ++ vars.recordId ++ "\"]]",
+								"fields": "[\"name\",\"customer_name\",\"custom_salesforce_id\"]"
+							}]]]></http:query-params>
+						</http:request>
+
+						<set-variable variableName="erpFallbackName"
+							value="#[(payload.data default [])[0].name default null]"
+							doc:name="Store re-check ERP name" />
+
+						<choice doc:name="ERP record exists now?">
+							<when expression="#[vars.erpFallbackName != null]">
+								<!-- Step 3a: CREATE finished in the meantime → update instead of create -->
+								<logger level="INFO" doc:name="Log fallback resolved to PUT"
+									message='#[output text/plain --- "ERP record appeared during fallback. Updating instead of creating. erpName=" ++ vars.erpFallbackName ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+								<ee:transform doc:name="Build fallback PUT payload from full SF data">
+									<ee:message>
+										<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.sfFallbackAccount
+---
+{
+  customer_name: account.Name    default "",
+  mobile_no:     account.Phone   default "",
+  website:       account.Website default ""
+}]]></ee:set-payload>
+									</ee:message>
+								</ee:transform>
+
+								<http:request method="PUT"
+									config-ref="ERP_Request_Config"
+									path="#['/Customer/' ++ (vars.erpFallbackName replace ' ' with '%20')]"
+									doc:name="PUT Customer to ERPNext (fallback update)">
+									<http:headers><![CDATA[#[{
+										"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+										"Content-Type": "application/json"
+									}]]]></http:headers>
+								</http:request>
+
+								<logger level="INFO" doc:name="Log fallback PUT success"
+									message='#[output text/plain --- "Fallback PUT successful. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+							</when>
+							<otherwise>
+								<!-- Step 3b: still not there → safe to create, no duplicate risk -->
+								<ee:transform doc:name="Build fallback POST payload">
+									<ee:message>
+										<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var account = vars.sfFallbackAccount
+---
+{
+  customer_name:        account.Name     default "",
+  customer_type:        "Company",
+  customer_group:       "Commercial",
+  territory:            "United States",
+  mobile_no:            account.Phone   default "",
+  website:              account.Website default "",
+  custom_salesforce_id: vars.recordId
+}]]></ee:set-payload>
+									</ee:message>
+								</ee:transform>
+
+								<http:request method="POST"
+									config-ref="ERP_Request_Config" path="/Customer"
+									doc:name="POST Customer to ERPNext (fallback create)">
+									<http:headers><![CDATA[#[{
+										"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+										"Content-Type": "application/json"
+									}]]]></http:headers>
+								</http:request>
+
+								<logger level="INFO" doc:name="Log fallback POST success"
+									message='#[output text/plain --- "Fallback POST successful. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+							</otherwise>
+						</choice>
+					</when>
+					<otherwise>
+						<logger level="ERROR" doc:name="Log Salesforce account not found"
+							message='#[output text/plain --- "Salesforce Account not found for fallback. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+					</otherwise>
+				</choice>
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<!-- ═══════════════════════════════════════════════════ SYSTEM LAYER —
+		DEACTIVATE Marks ERPNext Customer as disabled on Salesforce delete. Preserves
+		historical data — does not hard delete. ═══════════════════════════════════════════════════ -->
+	<sub-flow name="sys-erp-deactivate-account"
+		doc:id="sys-erp-deactivate-account">
+
+		<http:request method="GET"
+			config-ref="ERP_Request_Config" path="/Customer"
+			doc:name="GET Customer by Salesforce ID">
+			<http:headers><![CDATA[#[{
+				"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+			}]]]></http:headers>
+			<http:query-params><![CDATA[#[{
+				"filters": "[[\"Customer\",\"custom_salesforce_id\",\"=\",\"" ++ vars.recordId ++ "\"]]",
+				"fields": "[\"name\",\"customer_name\",\"custom_salesforce_id\"]"
+			}]]]></http:query-params>
+		</http:request>
+
+		<set-variable variableName="erpCustomerName"
+			value="#[(payload.data default [])[0].name default null]"
+			doc:name="Store ERPNext customer document name" />
+
+		<choice doc:name="ERP customer found?">
+			<when expression="#[vars.erpCustomerName != null]">
+				<ee:transform doc:name="Build ERPNext deactivate payload">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  disabled: 1
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+
+				<http:request method="PUT"
+					config-ref="ERP_Request_Config"
+					path="#['/Customer/' ++ (vars.erpCustomerName replace ' ' with '%20')]"
+					doc:name="PUT disable Customer in ERPNext">
+					<http:headers><![CDATA[#[{
+						"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+						"Content-Type": "application/json"
+					}]]]></http:headers>
+				</http:request>
+
+				<logger level="INFO" doc:name="Log ERPNext deactivate"
+					message='#[output text/plain --- "ERPNext customer disabled. erpName=" ++ vars.erpCustomerName ++ " recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+			</when>
+			<otherwise>
+				<!-- ERP record not found — most likely a race where DELETE and CREATE
+					 were both buffered and DELETE ran first. Store a marker so that
+					 sys-erp-create-account disables the record the moment it creates it. -->
+				<logger level="WARN" doc:name="Log pending disable stored"
+					message='#[output text/plain --- "ERP customer not found for DELETE — storing pending disable marker. Record will be disabled when CREATE completes. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+
+				<os:store key="#['pending_disable_' ++ vars.recordId]"
+					objectStore="idempotency-store"
+					doc:name="Store pending disable marker">
+					<os:value>#[true]</os:value>
+				</os:store>
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+</mule>

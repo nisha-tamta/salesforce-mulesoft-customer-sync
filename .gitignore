@@ -1,0 +1,44 @@
+# Build output
+**/target/
+**/build/
+
+# Mule / Studio local cache
+**/.mule/
+**/exchange-docs/
+
+# Mule / Java / Maven
+*.class
+*.jar
+*.war
+*.ear
+*.log
+
+# IDE files
+.classpath
+.project
+.settings/
+.idea/
+*.iml
+*.code-workspace
+application-types.xml
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+settings.json
+
+# Temp files
+*.tmp
+*.swp
+
+# Environment / local config
+.env
+
+# Secrets
+secure.properties
+*.secure.properties
+config-local.yaml
+config-local.properties
+config.properties

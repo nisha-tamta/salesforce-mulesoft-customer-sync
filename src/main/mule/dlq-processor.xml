@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!-- Shares the HTTP listener config defined in account-cdc-sync.xml (same app, same port).
+		 dlq-store ObjectStore is also defined there and referenced here by name. -->
+	<http:listener-config name="Admin_HTTP_Listener_Config"
+		doc:name="Admin HTTP Listener Config">
+		<http:listener-connection host="${http.host}" port="${http.port}" />
+	</http:listener-config>
+
+	<!-- ═══════════════════════════════════════════════════
+		 GET /api/admin/dlq
+		 Returns a list of all DLQ entry keys.
+		 Each key is the correlationId of the failed event.
+		 Use GET /api/admin/dlq/{key} to inspect a specific entry. ═══════════════════════════════════════════════════ -->
+	<flow name="admin-dlq-list" doc:id="admin-dlq-list">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/dlq" allowedMethods="GET"
+			doc:name="GET /api/admin/dlq" />
+
+		<os:retrieve-all-keys objectStore="dlq-store"
+			doc:name="Retrieve all DLQ keys" />
+
+		<ee:transform doc:name="Build DLQ list response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  count: sizeOf(payload default []),
+  keys:  (payload default []) as Array
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════
+		 GET /api/admin/dlq/{key}
+		 Returns the full stored entry for a specific DLQ key. ═══════════════════════════════════════════════════ -->
+	<flow name="admin-dlq-get-entry" doc:id="admin-dlq-get-entry">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/dlq/{key}" allowedMethods="GET"
+			doc:name="GET /api/admin/dlq/{key}" />
+
+		<os:retrieve key="#[attributes.uriParams.key]"
+			objectStore="dlq-store"
+			doc:name="Retrieve DLQ entry" />
+
+		<ee:transform doc:name="Build entry response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<error-handler>
+			<on-error-continue type="OS:KEY_NOT_FOUND" doc:name="Handle key not found">
+				<ee:transform doc:name="Build 404 response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "DLQ entry not found", key: attributes.uriParams.key }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════
+		 POST /api/admin/dlq/{key}/replay
+		 Replays a single DLQ entry by restoring its context variables
+		 and re-running the correct process flow.
+		 On success: removes the entry from the DLQ.
+		 On failure: keeps the entry in the DLQ so it can be retried. ═══════════════════════════════════════════════════ -->
+	<flow name="admin-dlq-replay" doc:id="admin-dlq-replay">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/dlq/{key}/replay" allowedMethods="POST"
+			doc:name="POST /api/admin/dlq/{key}/replay" />
+
+		<!-- Save key immediately — attributes.uriParams is lost after flow-ref calls -->
+		<set-variable variableName="dlqKey"
+			value="#[attributes.uriParams.key]"
+			doc:name="Save DLQ key" />
+
+		<os:retrieve key="#[vars.dlqKey]"
+			objectStore="dlq-store"
+			target="dlqEntry"
+			doc:name="Retrieve DLQ entry" />
+
+		<!-- Restore the event context so process flows work exactly as they
+			 would for a live CDC event. A fresh correlationId marks this as a replay. -->
+		<set-variable variableName="correlationId"
+			value="#[vars.dlqEntry.correlationId ++ '_replay_' ++ uuid()]"
+			doc:name="Set replay correlationId" />
+		<set-variable variableName="replayId"     value="#[vars.dlqEntry.replayId]"     doc:name="Restore replayId" />
+		<set-variable variableName="recordId"     value="#[vars.dlqEntry.recordId]"     doc:name="Restore recordId" />
+		<set-variable variableName="changeType"   value="#[vars.dlqEntry.changeType]"   doc:name="Restore changeType" />
+		<set-variable variableName="changedFields"
+			value="#[read(vars.dlqEntry.changedFields, 'application/json')]"
+			doc:name="Restore changedFields" />
+		<set-variable variableName="accountData"
+			value="#[read(vars.dlqEntry.accountData, 'application/json')]"
+			doc:name="Restore accountData" />
+
+		<logger level="INFO" doc:name="Log replay start"
+			message='#[output text/plain --- "Replaying DLQ entry. key=" ++ vars.dlqKey ++ " recordId=" ++ vars.recordId ++ " changeType=" ++ vars.changeType ++ " newCorrelationId=" ++ vars.correlationId]' />
+
+		<choice doc:name="Route replay by changeType">
+			<when expression="#[vars.changeType == 'CREATE' or vars.changeType == 'UPDATE' or vars.changeType == 'UNDELETE']">
+				<flow-ref name="proc-account-cdc-sync" doc:name="proc-account-cdc-sync" />
+			</when>
+			<when expression="#[vars.changeType == 'DELETE' or vars.changeType == 'GAP_DELETE']">
+				<flow-ref name="proc-account-cdc-delete" doc:name="proc-account-cdc-delete" />
+			</when>
+			<otherwise>
+				<logger level="WARN" doc:name="Log unknown changeType in DLQ"
+					message='#[output text/plain --- "Unknown changeType in DLQ entry — cannot replay. key=" ++ attributes.uriParams.key ++ " changeType=" ++ vars.changeType]' />
+			</otherwise>
+		</choice>
+
+		<!-- Remove from DLQ only after successful replay -->
+		<os:remove key="#[vars.dlqKey]" objectStore="dlq-store"
+			doc:name="Remove replayed entry from DLQ" />
+
+		<ee:transform doc:name="Build replay success response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message:          "Replayed successfully and removed from DLQ",
+  key:              vars.dlqKey,
+  recordId:         vars.recordId,
+  changeType:       vars.changeType,
+  newCorrelationId: vars.correlationId
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true"
+				doc:name="Replay error — keep in DLQ">
+				<logger level="ERROR" doc:name="Log replay failure"
+					message='#[output text/plain --- "DLQ replay failed — entry kept in DLQ. key=" ++ (vars.dlqKey default "UNKNOWN") ++ " error=" ++ error.description]' />
+				<ee:transform doc:name="Build replay error response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "Replay failed — entry remains in DLQ",
+  key:     vars.dlqKey,
+  error:   error.description
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════
+		 DELETE /api/admin/dlq/{key}
+		 Removes a single entry from the DLQ without replaying it. ═══════════════════════════════════════════════════ -->
+	<flow name="admin-dlq-remove-one" doc:id="admin-dlq-remove-one">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/dlq/{key}" allowedMethods="DELETE"
+			doc:name="DELETE /api/admin/dlq/{key}" />
+
+		<os:remove key="#[attributes.uriParams.key]" objectStore="dlq-store"
+			doc:name="Remove DLQ entry" />
+
+		<ee:transform doc:name="Build remove response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "Removed from DLQ", key: attributes.uriParams.key }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════
+		 DELETE /api/admin/dlq
+		 Clears all DLQ entries. Use with care — clears without replay. ═══════════════════════════════════════════════════ -->
+	<flow name="admin-dlq-clear" doc:id="admin-dlq-clear">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/dlq" allowedMethods="DELETE"
+			doc:name="DELETE /api/admin/dlq" />
+
+		<os:clear objectStore="dlq-store"
+			doc:name="Clear all DLQ entries" />
+
+		<ee:transform doc:name="Build clear response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "DLQ cleared" }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+</mule>

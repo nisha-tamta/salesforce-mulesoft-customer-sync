@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="
+		http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+		http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+	<!-- ═══════════════════════════════════════════════════════════════════════
+		 POST /api/admin/reconcile
+		 Triggers the reconciliation job immediately without waiting for 2am.
+		 Useful after an ERP outage to catch up missed deletes/updates.
+		 Reuses Admin_HTTP_Listener_Config from dlq-processor.xml — same port,
+		 different path. Only one config can bind a port per app. ═══════════════════════════════════════════════════════════════════════ -->
+	<flow name="admin-reconcile-trigger" doc:id="admin-reconcile-trigger">
+		<http:listener config-ref="Admin_HTTP_Listener_Config"
+			path="/api/admin/reconcile" allowedMethods="POST"
+			doc:name="POST /api/admin/reconcile" />
+
+		<set-variable variableName="reconciliationId"
+			value="#[uuid() as String]"
+			doc:name="Set reconciliationId" />
+
+		<flow-ref name="reconciliation-job-logic" doc:name="Run reconciliation" />
+
+		<ee:transform doc:name="Build trigger response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message:          "Reconciliation complete",
+  reconciliationId: vars.reconciliationId,
+  summary:          vars.reconResult.summary
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- ═══════════════════════════════════════════════════════════════════════
+		 Nightly reconciliation job — runs at 02:00 UTC every day.
+
+		 Purpose: catch anything the CDC flow missed — race conditions that slipped
+		 through, Salesforce events that were never delivered, or manual fixes applied
+		 directly in one system without the other being updated.
+
+		 Steps:
+		   1. Query all active Accounts from Salesforce.
+		   2. Query all ERPNext Customers that have a custom_salesforce_id.
+		   3. Compare the two sets:
+		        missing   — in SF but not yet in ERP → create them
+		        stale     — in both but fields differ → update ERP
+		        orphaned  — in ERP but no matching SF record → log warning
+		   4. Log a reconciliation summary report.
+
+		 Reuses sys-erp-create-account (idempotent upsert) for both missing and
+		 stale records — that subflow already does GET-then-PUT-or-POST, so it
+		 handles both cases without needing a separate update path.
+		 ═══════════════════════════════════════════════════════════════════════ -->
+	<flow name="reconciliation-job" doc:id="reconciliation-job">
+		<scheduler doc:name="Nightly reconciliation scheduler">
+			<scheduling-strategy>
+				<cron expression="0 0 2 * * ?" timeZone="UTC" />
+			</scheduling-strategy>
+		</scheduler>
+
+		<set-variable variableName="reconciliationId"
+			value="#[uuid() as String]"
+			doc:name="Set reconciliationId" />
+
+		<logger level="INFO" doc:name="Log reconciliation start"
+			message='#[output text/plain --- "Nightly reconciliation started. reconciliationId=" ++ vars.reconciliationId]' />
+
+		<flow-ref name="reconciliation-job-logic" doc:name="Run reconciliation logic" />
+
+		<logger level="INFO" doc:name="Log reconciliation complete"
+			message='#[output text/plain --- "Nightly reconciliation complete. created=" ++ (vars.reconResult.summary.missingCount as String) ++ " updated=" ++ (vars.reconResult.summary.staleCount as String) ++ " disabled=" ++ (vars.reconResult.summary.orphanedCount as String) ++ " reconciliationId=" ++ vars.reconciliationId]' />
+
+		<error-handler>
+			<on-error-continue type="ANY" logException="true"
+				doc:name="Reconciliation error handler">
+				<logger level="ERROR" doc:name="Log reconciliation error"
+					message='#[output text/plain --- "Nightly reconciliation job failed. error=" ++ error.description ++ " reconciliationId=" ++ (vars.reconciliationId default "UNKNOWN")]' />
+			</on-error-continue>
+		</error-handler>
+	</flow>
+
+	<!-- Shared logic called by both the scheduler and the on-demand HTTP trigger -->
+	<sub-flow name="reconciliation-job-logic" doc:id="reconciliation-job-logic">
+
+		<!-- ── Step 1: fetch all active Salesforce Accounts ────────────────── -->
+		<salesforce:query doc:name="Query all active Salesforce Accounts"
+			config-ref="Salesforce_Config">
+			<salesforce:salesforce-query><![CDATA[SELECT Id, Name, Phone, Website FROM Account WHERE IsDeleted = false ORDER BY LastModifiedDate ASC]]></salesforce:salesforce-query>
+		</salesforce:query>
+
+		<set-variable variableName="sfAccounts"
+			value="#[payload]"
+			doc:name="Store Salesforce accounts" />
+
+		<logger level="INFO" doc:name="Log SF query result"
+			message='#[output text/plain --- "Salesforce accounts fetched. count=" ++ sizeOf(vars.sfAccounts default []) as String ++ " reconciliationId=" ++ vars.reconciliationId]' />
+
+		<!-- ── Step 2: fetch all ERPNext Customers that have a Salesforce ID ── -->
+		<http:request method="GET"
+			config-ref="ERP_Request_Config" path="/Customer"
+			doc:name="Query ERPNext Customers with Salesforce ID">
+			<http:headers><![CDATA[#[{
+				"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret')
+			}]]]></http:headers>
+			<http:query-params><![CDATA[#[{
+				"filters":           "[[\"Customer\",\"custom_salesforce_id\",\"!=\",\"\"]]",
+				"fields":            "[\"name\",\"custom_salesforce_id\",\"customer_name\",\"mobile_no\",\"website\"]",
+				"limit_page_length": "10000"
+			}]]]></http:query-params>
+		</http:request>
+
+		<set-variable variableName="erpCustomers"
+			value="#[payload.data default []]"
+			doc:name="Store ERP customers" />
+
+		<logger level="INFO" doc:name="Log ERP query result"
+			message='#[output text/plain --- "ERPNext customers fetched. count=" ++ sizeOf(vars.erpCustomers default []) as String ++ " reconciliationId=" ++ vars.reconciliationId]' />
+
+		<!-- ── Step 3: compute diff ─────────────────────────────────────────── -->
+		<ee:transform doc:name="Compute reconciliation diff">
+			<ee:variables>
+				<ee:set-variable variableName="reconResult"><![CDATA[%dw 2.0
+output application/java
+
+var sfById    = (vars.sfAccounts   default []) groupBy ($.Id)
+var erpBySfId = (vars.erpCustomers default []) groupBy ($.custom_salesforce_id)
+
+var missingInERP = (vars.sfAccounts default []) filter (sfRec) ->
+    erpBySfId[sfRec.Id] == null
+
+var staleInERP = (vars.sfAccounts default []) filter (sfRec) -> do {
+    var match = (erpBySfId[sfRec.Id] default [null])[0]
+    ---
+    match != null and (
+        (match.customer_name default "") != (sfRec.Name    default "") or
+        (match.mobile_no     default "") != (sfRec.Phone   default "") or
+        (match.website       default "") != (sfRec.Website default "")
+    )
+}
+
+// ERP record has a SF ID but no active SF Account — most likely the SF Account
+// was deleted while ERP was unreachable and the DELETE CDC event was lost
+var orphanedInERP = (vars.erpCustomers default []) filter (erpRec) ->
+    sfById[erpRec.custom_salesforce_id] == null
+---
+{
+    missingInERP:  missingInERP,
+    staleInERP:    staleInERP,
+    orphanedInERP: orphanedInERP,
+    summary: {
+        totalSF:       sizeOf(vars.sfAccounts   default []),
+        totalERP:      sizeOf(vars.erpCustomers default []),
+        missingCount:  sizeOf(missingInERP),
+        staleCount:    sizeOf(staleInERP),
+        orphanedCount: sizeOf(orphanedInERP)
+    }
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+
+		<logger level="INFO" doc:name="Log reconciliation summary"
+			message='#[output text/plain --- "Reconciliation diff computed. missing=" ++ (vars.reconResult.summary.missingCount as String) ++ " stale=" ++ (vars.reconResult.summary.staleCount as String) ++ " orphaned=" ++ (vars.reconResult.summary.orphanedCount as String) ++ " reconciliationId=" ++ vars.reconciliationId]' />
+
+		<!-- ── Step 4: create missing records ──────────────────────────────── -->
+		<foreach collection="#[vars.reconResult.missingInERP]"
+			doc:name="Create missing ERP records">
+			<set-variable variableName="recordId"    value="#[payload.Id]"                    doc:name="Set recordId" />
+			<set-variable variableName="accountData" value="#[payload]"                       doc:name="Set accountData" />
+			<set-variable variableName="correlationId" value="#['recon_create_' ++ uuid()]"   doc:name="Set correlationId" />
+			<logger level="INFO" doc:name="Log creating missing record"
+				message='#[output text/plain --- "Reconciliation: creating missing ERP record. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+			<flow-ref name="sys-erp-create-account" doc:name="sys-erp-create-account" />
+		</foreach>
+
+		<!-- ── Step 5: update stale records ────────────────────────────────── -->
+		<foreach collection="#[vars.reconResult.staleInERP]"
+			doc:name="Update stale ERP records">
+			<set-variable variableName="recordId"    value="#[payload.Id]"                    doc:name="Set recordId" />
+			<set-variable variableName="accountData" value="#[payload]"                       doc:name="Set accountData" />
+			<set-variable variableName="correlationId" value="#['recon_update_' ++ uuid()]"   doc:name="Set correlationId" />
+			<logger level="INFO" doc:name="Log updating stale record"
+				message='#[output text/plain --- "Reconciliation: updating stale ERP record. recordId=" ++ vars.recordId ++ " correlationId=" ++ vars.correlationId]' />
+			<flow-ref name="sys-erp-create-account" doc:name="sys-erp-create-account (upsert)" />
+		</foreach>
+
+		<!-- ── Step 6: disable orphaned ERP records ─────────────────────────
+			 These are in ERP with a SF ID that no longer has an active SF Account.
+			 Root cause: SF Account was deleted while ERP was down → CDC event lost.
+			 Disable (not delete) to preserve history. If the SF Account is restored,
+			 the next CDC UNDELETE or reconciliation run will re-enable it. -->
+		<foreach collection="#[vars.reconResult.orphanedInERP]"
+			doc:name="Disable orphaned ERP records">
+			<set-variable variableName="orphanErpName"
+				value="#[payload.name default null]"
+				doc:name="Store ERP document name" />
+
+			<logger level="WARN" doc:name="Log orphaned record"
+				message='#[output text/plain --- "Reconciliation: disabling orphaned ERP customer — no matching active SF Account. erpName=" ++ (vars.orphanErpName default "UNKNOWN") ++ " custom_salesforce_id=" ++ (payload.custom_salesforce_id default "UNKNOWN") ++ " reconciliationId=" ++ vars.reconciliationId]' />
+
+			<ee:transform doc:name="Build disable payload">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ disabled: 1 }]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+
+			<http:request method="PUT"
+				config-ref="ERP_Request_Config"
+				path="#['/Customer/' ++ ((vars.orphanErpName default '') replace ' ' with '%20')]"
+				doc:name="PUT disable orphaned ERP customer">
+				<http:headers><![CDATA[#[{
+					"Authorization": "token " ++ p('erp.apiKey') ++ ":" ++ p('erp.apiSecret'),
+					"Content-Type": "application/json"
+				}]]]></http:headers>
+			</http:request>
+
+			<logger level="INFO" doc:name="Log orphan disabled"
+				message='#[output text/plain --- "Reconciliation: ERP customer disabled. erpName=" ++ (vars.orphanErpName default "UNKNOWN") ++ " reconciliationId=" ++ vars.reconciliationId]' />
+		</foreach>
+
+	</sub-flow>
+
+</mule>
