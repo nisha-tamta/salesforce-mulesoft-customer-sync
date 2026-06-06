@@ -8,7 +8,7 @@ Built on MuleSoft 4 / Anypoint Studio with four production resilience patterns: 
 
 ## Architecture
 
-![Architecture diagram](docs/cdc-architecture-diagram.svg)
+![Architecture diagram](docs/cdc-architecture-diagram.png)
 
 ### API-led layers
 
@@ -118,7 +118,7 @@ salesforce-mulesoft-customer-sync/
 │       └── resources/
 │           └── config.properties         # All environment configuration
 ├── docs/
-│   └── cdc-architecture-diagram.svg
+│   └── cdc-architecture-diagram.png
 └── pom.xml
 ```
 
